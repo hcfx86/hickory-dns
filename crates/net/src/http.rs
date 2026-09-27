@@ -7,13 +7,14 @@
 
 //! HTTP protocol related components for DNS over HTTP/2 (DoH) and HTTP/3 (DoH3)
 
+use core::fmt::Debug;
 use core::str::FromStr;
 use std::sync::Arc;
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
 use http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE};
-use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, Uri, header, uri};
+use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri, header, uri};
 use tracing::debug;
 
 use crate::error::NetError;
@@ -70,6 +71,47 @@ impl RequestContext {
         request
             .body(())
             .map_err(|e| NetError::from(format!("http stream errored: {e}")))
+    }
+}
+
+/// Given an HTTP request, return a future that will result in the next sequence of bytes.
+///
+/// To allow downstream clients to do something interesting with the lifetime of the bytes, this doesn't
+///   perform a conversion to a Message, only collects all the bytes.
+pub async fn message_from<R, E>(
+    this_server_name: Option<Arc<str>>,
+    this_server_endpoint: Arc<str>,
+    request: Request<R>,
+) -> Result<BytesMut, NetError>
+where
+    R: Stream<Item = Result<Bytes, E>> + 'static + Send + Debug + Unpin,
+    E: Into<NetError>,
+{
+    debug!("Received request: {:#?}", request);
+
+    let this_server_name = this_server_name.as_deref();
+    match verify(
+        Version::Http2,
+        this_server_name,
+        &this_server_endpoint,
+        &request,
+    ) {
+        Ok(_) => (),
+        Err(err) => return Err(err),
+    }
+
+    // attempt to get the content length
+    let mut content_length = None;
+    if let Some(length) = request.headers().get(CONTENT_LENGTH) {
+        let length = usize::from_str(length.to_str()?)?;
+        debug!("got message length: {}", length);
+        content_length = Some(length);
+    }
+
+    match *request.method() {
+        Method::GET => Err(format!("GET unimplemented: {}", request.method()).into()),
+        Method::POST => fetch_body(request.into_body(), content_length).await,
+        _ => Err(format!("bad method: {}", request.method()).into()),
     }
 }
 
