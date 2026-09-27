@@ -366,12 +366,14 @@ impl<T: RequestHandler> Server<T> {
         timeout: Option<Duration>,
         server_cert_resolver: Arc<dyn ResolvesServerCert>,
         dns_hostname: Option<String>,
+        http_endpoint: String,
     ) -> io::Result<()> {
         self.join_set.spawn(h3_handler::handle_h3(
             socket,
             timeout,
             server_cert_resolver,
             dns_hostname,
+            http_endpoint,
             self.context.clone(),
         ));
         Ok(())
@@ -401,11 +403,13 @@ impl<T: RequestHandler> Server<T> {
         timeout: Option<Duration>,
         tls_config: Arc<ServerConfig>,
         dns_hostname: Option<String>,
+        http_endpoint: String,
     ) -> Result<(), NetError> {
         self.join_set.spawn(h3_handler::handle_h3_with_server(
             H3Server::with_socket_and_tls_config(socket, tls_config)?,
             timeout,
             dns_hostname,
+            http_endpoint,
             self.context.clone(),
         ));
         Ok(())
@@ -1210,6 +1214,7 @@ mod tests {
                         Some(Duration::from_secs(1)),
                         cert_key,
                         None,
+                        "/dns-query".into(),
                     )
                     .unwrap();
             }

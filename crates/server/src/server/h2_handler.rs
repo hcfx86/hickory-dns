@@ -25,7 +25,7 @@ use super::{
 };
 use crate::{
     net::{
-        NetError, h2,
+        NetError,
         http::{self, Version},
         xfer::Protocol,
     },

@@ -11,7 +11,7 @@ use core::fmt::Debug;
 use core::str::FromStr;
 use std::sync::Arc;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use futures_util::{Stream, StreamExt};
 use http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri, header, uri};
@@ -78,18 +78,17 @@ impl RequestContext {
 ///
 /// To allow downstream clients to do something interesting with the lifetime of the bytes, this doesn't
 ///   perform a conversion to a Message, only collects all the bytes.
-pub async fn message_from<R, E>(
+pub async fn message_from<R, E, B>(
     http_version: Version,
     this_server_name: Option<Arc<str>>,
     this_server_endpoint: Arc<str>,
     request: Request<R>,
 ) -> Result<BytesMut, NetError>
 where
-    R: Stream<Item = Result<Bytes, E>> + 'static + Send + Debug + Unpin,
+    R: Stream<Item = Result<B, E>> + 'static + Send + Unpin,
     E: Into<NetError>,
+    B: Buf,
 {
-    debug!("Received request: {:#?}", request);
-
     let this_server_name = this_server_name.as_deref();
     match verify(
         http_version,
@@ -301,6 +300,9 @@ pub const DEFAULT_DNS_QUERY_PATH: &str = "/dns-query";
 
 #[cfg(test)]
 mod tests {
+    use core::pin::Pin;
+    use core::task::{Context, Poll};
+
     use bytes::Bytes;
     use futures_util::stream;
     use http::{
@@ -309,6 +311,8 @@ mod tests {
     };
 
     use super::*;
+    use crate::proto::op::Message;
+    use test_support::subscribe;
 
     #[test]
     #[cfg(feature = "__https")]
@@ -385,6 +389,62 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "__https")]
+    async fn test_from_post_h2() {
+        test_from_post(Version::Http2).await
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "__h3")]
+    async fn test_from_post_h3() {
+        test_from_post(Version::Http3).await
+    }
+
+    async fn test_from_post(version: Version) {
+        subscribe();
+        let message = Message::query();
+        let msg_bytes = message.to_vec().unwrap();
+        let len = msg_bytes.len();
+        let stream = TestBytesStream(vec![Ok(Bytes::from(msg_bytes))]);
+        let cx = RequestContext {
+            version,
+            server_name: Arc::from("ns.example.com"),
+            query_path: Arc::from("/dns-query"),
+            set_headers: None,
+        };
+
+        let request = cx.build(len).unwrap();
+        let request = request.map(|()| stream);
+
+        let bytes = message_from(
+            version,
+            Some(Arc::from("ns.example.com")),
+            "/dns-query".into(),
+            request,
+        )
+        .await
+        .unwrap();
+
+        let msg_from_post = Message::from_vec(bytes.as_ref()).expect("bytes failed");
+        assert_eq!(message, msg_from_post);
+    }
+
+    #[derive(Debug)]
+    struct TestBytesStream(Vec<Result<Bytes, NetError>>);
+
+    impl Stream for TestBytesStream {
+        type Item = Result<Bytes, NetError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            match self.0.pop() {
+                Some(Ok(bytes)) => Poll::Ready(Some(Ok(bytes))),
+                Some(Err(err)) => Poll::Ready(Some(Err(err))),
+                None => Poll::Ready(None),
+            }
+        }
     }
 
     impl SetHeaders for Vec<(HeaderName, HeaderValue)> {
