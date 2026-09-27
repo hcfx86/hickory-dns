@@ -18,6 +18,7 @@ use bytes::{Buf, Bytes};
 use futures_util::stream::Stream;
 use h3::client::SendRequest;
 use h3_quinn::OpenStreams;
+use http::Method;
 use http::header::{self, CONTENT_LENGTH};
 use quinn::{Endpoint, EndpointConfig, TransportConfig};
 use tokio::sync::mpsc;
@@ -26,7 +27,7 @@ use tracing::{debug, warn};
 
 use super::{ALPN_H3, BodyStream};
 use crate::error::NetError;
-use crate::http::{RequestContext, SetHeaders, Version, fetch_body};
+use crate::http::{RequestContext, SetHeaders, Version, fetch_body, select_request_method};
 use crate::proto::ProtoError;
 use crate::proto::op::{DnsRequest, DnsResponse};
 use crate::quic::connect_quic;
@@ -64,14 +65,21 @@ impl H3ClientStream {
         mut h3: SendRequest<OpenStreams, Bytes>,
         message: Bytes,
         cx: Arc<RequestContext>,
+        method: Method,
     ) -> Result<DnsResponse, NetError> {
         // build up the http request
-        let request = cx.build(message.remaining())?;
+        let (request, body) = match method {
+            Method::GET => (cx.build_get(message)?, None),
+            Method::POST => (cx.build_post(message.remaining())?, Some(message)),
+            other => return Err(format!("unsupported method: {other}").into()),
+        };
         debug!("request: {:#?}", request);
 
         // Send the request
         let mut stream = h3.send_request(request).await?;
-        stream.send_data(message).await?;
+        if let Some(body) = body {
+            stream.send_data(body).await?;
+        }
         stream.finish().await?;
 
         let response = stream.recv_response().await?;
@@ -190,16 +198,20 @@ impl DnsRequestSender for H3ClientStream {
 
         // per the RFC, a zero id allows for the HTTP packet to be cached better
         request.metadata.id = 0;
+        let op_code = request.op_code;
 
         let bytes = match request.to_vec() {
             Ok(bytes) => bytes,
             Err(err) => return NetError::from(err).into(),
         };
 
+        let method = select_request_method(op_code, bytes.len(), &self.context);
+
         Box::pin(Self::inner_send(
             self.send_request.clone(),
             Bytes::from(bytes),
             self.context.clone(),
+            method,
         ))
         .into()
     }

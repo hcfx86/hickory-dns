@@ -19,6 +19,7 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 use futures_util::stream::Stream;
 use h2::client::SendRequest;
+use http::Method;
 use http::header::{self, CONTENT_LENGTH};
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
@@ -124,12 +125,13 @@ impl DnsRequestSender for HttpsClientStream {
             Err(err) => return NetError::from(err).into(),
         };
 
-        let _method = select_request_method(op_code, bytes.len(), &self.context);
+        let method = select_request_method(op_code, bytes.len(), &self.context);
 
         Box::pin(send(
             self.h2.clone(),
             Bytes::from(bytes),
             self.context.clone(),
+            method,
         ))
         .into()
     }
@@ -299,20 +301,24 @@ async fn send(
     h2: SendRequest<Bytes>,
     message: Bytes,
     cx: Arc<RequestContext>,
+    method: Method,
 ) -> Result<DnsResponse, NetError> {
     let mut h2 = h2.ready().await?;
 
     // build up the http request
-    let request = cx.build(message.remaining())?;
-
+    let (request, body) = match method {
+        Method::GET => (cx.build_get(message)?, None),
+        Method::POST => (cx.build_post(message.remaining())?, Some(message)),
+        other => return Err(format!("unsupported method: {other}").into()),
+    };
     debug!("request: {:#?}", request);
 
     // Send the request
-    let (response_future, mut send_stream) = h2.send_request(request, false)?;
-    send_stream.send_data(message, true)?;
-
+    let (response_future, mut send_stream) = h2.send_request(request, body.is_none())?;
+    if let Some(body) = body {
+        send_stream.send_data(body, true)?;
+    }
     let mut response_stream = response_future.await?;
-
     debug!("got response: {:#?}", response_stream);
 
     // get the length of packet

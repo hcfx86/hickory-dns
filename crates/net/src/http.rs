@@ -11,12 +11,10 @@ use core::fmt::Debug;
 use core::str::FromStr;
 use std::sync::Arc;
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
 use http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE};
-use http::{
-    HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri, header, method, uri,
-};
+use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri, header, uri};
 use tracing::debug;
 use url::form_urlencoded;
 
@@ -66,17 +64,8 @@ impl RequestContext {
     /// request (as described in Section 6), encoded with base64url
     /// [RFC4648].
     /// ```
-    pub(crate) fn build(&self, message_len: usize) -> Result<Request<()>, NetError> {
-        let mut parts = uri::Parts::default();
-        parts.path_and_query = Some(
-            uri::PathAndQuery::try_from(&*self.query_path)
-                .map_err(|e| NetError::from(format!("invalid DoH path: {e}")))?,
-        );
-        parts.scheme = Some(uri::Scheme::HTTPS);
-        parts.authority = Some(
-            uri::Authority::from_str(&self.server_name)
-                .map_err(|e| NetError::from(format!("invalid authority: {e}")))?,
-        );
+    pub(crate) fn build_post(&self, message_len: usize) -> Result<Request<()>, NetError> {
+        let parts = self.build_parts(None)?;
 
         let url =
             Uri::from_parts(parts).map_err(|e| NetError::from(format!("uri parse error: {e}")))?;
@@ -99,6 +88,59 @@ impl RequestContext {
         request
             .body(())
             .map_err(|e| NetError::from(format!("http stream errored: {e}")))
+    }
+
+    pub(crate) fn build_get(&self, message: Bytes) -> Result<Request<()>, NetError> {
+        let uri_str = self.query_path.to_string()
+            + "?dns="
+            + data_encoding::BASE64URL_NOPAD.encode(&message).as_str();
+        let parts = self.build_parts(Some(
+            uri::PathAndQuery::from_str(&uri_str)
+                .map_err(|e| format!("error building query string {}", e))?,
+        ))?;
+        let url =
+            Uri::from_parts(parts).map_err(|e| NetError::from(format!("uri parse error: {e}")))?;
+
+        // TODO: add user agent to TypedHeaders
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(url)
+            .version(self.version.to_http())
+            .header(ACCEPT, MIME_APPLICATION_DNS);
+
+        if let Some(headers) = &self.set_headers {
+            if let Some(map) = request.headers_mut() {
+                headers.set_headers(map)?;
+            }
+        }
+
+        request
+            .body(())
+            .map_err(|e| NetError::from(format!("http stream errored: {e}")))
+    }
+
+    fn build_parts(
+        &self,
+        path_and_query: Option<uri::PathAndQuery>,
+    ) -> Result<uri::Parts, NetError> {
+        let mut parts = uri::Parts::default();
+        match path_and_query {
+            None => {
+                parts.path_and_query = Some(
+                    uri::PathAndQuery::try_from(&*self.query_path)
+                        .map_err(|e| NetError::from(format!("invalid DoH path: {e}")))?,
+                );
+            }
+            Some(pq) => {
+                parts.path_and_query = Some(pq);
+            }
+        }
+        parts.scheme = Some(uri::Scheme::HTTPS);
+        parts.authority = Some(
+            uri::Authority::from_str(&self.server_name)
+                .map_err(|e| NetError::from(format!("invalid authority: {e}")))?,
+        );
+        Ok(parts)
     }
 }
 
@@ -390,7 +432,7 @@ mod tests {
             set_headers: None,
         };
 
-        let request = cx.build(512).expect("error converting to http");
+        let request = cx.build_post(512).expect("error converting to http");
         assert!(
             verify(
                 Version::Http2,
@@ -415,7 +457,7 @@ mod tests {
             )]) as Arc<dyn SetHeaders>),
         };
 
-        let request = cx.build(512).expect("error converting to http");
+        let request = cx.build_post(512).expect("error converting to http");
         assert!(
             verify(
                 Version::Http2,
@@ -445,7 +487,7 @@ mod tests {
             set_headers: None,
         };
 
-        let request = cx.build(512).expect("error converting to http");
+        let request = cx.build_post(512).expect("error converting to http");
         assert!(
             verify(
                 Version::Http3,
@@ -482,7 +524,7 @@ mod tests {
             set_headers: None,
         };
 
-        let request = cx.build(len).unwrap();
+        let request = cx.build_post(len).unwrap();
         let request = request.map(|()| stream);
 
         let bytes = message_from(
