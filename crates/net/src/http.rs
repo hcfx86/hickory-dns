@@ -14,7 +14,9 @@ use std::sync::Arc;
 use bytes::{Buf, BufMut, BytesMut};
 use futures_util::{Stream, StreamExt};
 use http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE};
-use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri, header, uri};
+use http::{
+    HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri, header, method, uri,
+};
 use tracing::debug;
 use url::form_urlencoded;
 
@@ -25,6 +27,31 @@ pub(crate) struct RequestContext {
     pub(crate) server_name: Arc<str>,
     pub(crate) query_path: Arc<str>,
     pub(crate) set_headers: Option<Arc<dyn SetHeaders>>,
+}
+
+// RFC 7230 §3.1.1's recommended 8000-octet minimum, halved for headroom
+// against stricter intermediaries (any HTTP proxy or CDN in between client
+// and server)
+const MAX_CLIENT_GET_URI_LEN: usize = 4000;
+const CLIENT_GET_URI_LEN_PADDING: usize = 13; // "https://".len() + "?dns=".len()
+
+/// Returns the selected method for the operation
+pub(crate) fn select_request_method(
+    op_code: crate::proto::op::OpCode,
+    request_len: usize,
+    cx: &RequestContext,
+) -> Method {
+    if op_code == crate::proto::op::OpCode::Query {
+        let total_len = data_encoding::BASE64URL_NOPAD.encode_len(request_len)
+            + cx.query_path.len()
+            + cx.server_name.len()
+            + CLIENT_GET_URI_LEN_PADDING;
+        if total_len > MAX_CLIENT_GET_URI_LEN {
+            return Method::POST;
+        }
+        return Method::GET;
+    }
+    Method::POST
 }
 
 impl RequestContext {

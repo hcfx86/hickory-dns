@@ -27,7 +27,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
 use crate::error::NetError;
-use crate::http::{RequestContext, SetHeaders, Version, fetch_body};
+use crate::http::{RequestContext, SetHeaders, Version, fetch_body, select_request_method};
 use crate::proto::op::{DnsRequest, DnsResponse};
 use crate::runtime::iocompat::AsyncIoStdAsTokio;
 use crate::runtime::{DnsTcpStream, RuntimeProvider, Spawn};
@@ -117,11 +117,14 @@ impl DnsRequestSender for HttpsClientStream {
 
         // per the RFC, a zero id allows for the HTTP packet to be cached better
         request.metadata.id = 0;
+        let op_code = request.op_code;
 
         let bytes = match request.to_vec() {
             Ok(bytes) => bytes,
             Err(err) => return NetError::from(err).into(),
         };
+
+        let _method = select_request_method(op_code, bytes.len(), &self.context);
 
         Box::pin(send(
             self.h2.clone(),
