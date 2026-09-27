@@ -16,6 +16,7 @@ use futures_util::{Stream, StreamExt};
 use http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri, header, uri};
 use tracing::debug;
+use url::form_urlencoded;
 
 use crate::error::NetError;
 
@@ -96,21 +97,31 @@ where
         &this_server_endpoint,
         &request,
     ) {
-        Ok(_) => (),
+        Ok(_) => {
+            debug!(
+                "verified request from: {}",
+                request
+                    .headers()
+                    .get(header::USER_AGENT)
+                    .map(|h| h.to_str().unwrap_or("bad user agent"))
+                    .unwrap_or("unknown user agent")
+            );
+        }
         Err(err) => return Err(err),
     }
 
-    // attempt to get the content length
-    let mut content_length = None;
-    if let Some(length) = request.headers().get(CONTENT_LENGTH) {
-        let length = usize::from_str(length.to_str()?)?;
-        debug!("got message length: {}", length);
-        content_length = Some(length);
-    }
-
     match *request.method() {
-        Method::GET => Err(format!("GET unimplemented: {}", request.method()).into()),
-        Method::POST => fetch_body(request.into_body(), content_length).await,
+        Method::GET => validate_and_decode_query_string_parameter(request.uri()),
+        Method::POST => {
+            // attempt to get the content length
+            let mut content_length = None;
+            if let Some(length) = request.headers().get(CONTENT_LENGTH) {
+                let length = usize::from_str(length.to_str()?)?;
+                debug!("got message length: {}", length);
+                content_length = Some(length);
+            }
+            fetch_body(request.into_body(), content_length).await
+        }
         _ => Err(format!("bad method: {}", request.method()).into()),
     }
 }
@@ -146,12 +157,15 @@ pub fn verify<T>(
         }
     }
 
-    // TODO: switch to mime::APPLICATION_DNS when that stabilizes
-    match request.headers().get(CONTENT_TYPE).map(|v| v.to_str()) {
-        Some(Ok(ctype)) if ctype == MIME_APPLICATION_DNS => {}
-        _ => return Err("unsupported content type".into()),
-    };
-
+    if request.version() != version.to_http() {
+        let message = match version {
+            #[cfg(feature = "__https")]
+            Version::Http2 => "only HTTP/2 supported",
+            #[cfg(feature = "__h3")]
+            Version::Http3 => "only HTTP/3 supported",
+        };
+        return Err(message.into());
+    }
     // TODO: switch to mime::APPLICATION_DNS when that stabilizes
     match request.headers().get(ACCEPT).map(|v| v.to_str()) {
         Some(Ok(ctype)) => {
@@ -179,26 +193,47 @@ pub fn verify<T>(
         None => return Err("Accept is unspecified".into()),
     };
 
-    if request.version() != version.to_http() {
-        let message = match version {
-            #[cfg(feature = "__https")]
-            Version::Http2 => "only HTTP/2 supported",
-            #[cfg(feature = "__h3")]
-            Version::Http3 => "only HTTP/3 supported",
-        };
-        return Err(message.into());
+    match *request.method() {
+        // Query string validation is performed at fetch_query_string_parameter,
+        // to avoid parsing the query string twice
+        Method::GET => Ok(()),
+        Method::POST => {
+            // TODO: switch to mime::APPLICATION_DNS when that stabilizes
+            match request.headers().get(CONTENT_TYPE).map(|v| v.to_str()) {
+                Some(Ok(ctype)) if ctype == MIME_APPLICATION_DNS => Ok(()),
+                _ => Err("unsupported content type".into()),
+            }
+        }
+        _ => Err(format!("bad method: {}", request.method()).into()),
+    }
+}
+
+/// Fetch the dns query from the request Uri
+fn validate_and_decode_query_string_parameter(uri: &Uri) -> Result<BytesMut, NetError> {
+    let query_str = uri
+        .query()
+        .ok_or_else(|| -> NetError { "no query string".into() })?;
+    let mut query = form_urlencoded::parse(query_str.as_bytes());
+
+    let (_, v) = query
+        .by_ref()
+        .find(|(k, _)| k == "dns")
+        .ok_or_else(|| -> NetError { "missing required dns parameter".into() })?;
+
+    if query.any(|(k, _)| k == "dns") {
+        return Err("only one dns parameter is allowed in the query string".into());
     }
 
-    debug!(
-        "verified request from: {}",
-        request
-            .headers()
-            .get(header::USER_AGENT)
-            .map(|h| h.to_str().unwrap_or("bad user agent"))
-            .unwrap_or("unknown user agent")
-    );
-
-    Ok(())
+    match data_encoding::BASE64URL_NOPAD.decode(v.as_bytes()) {
+        Ok(decoded_value) => {
+            if decoded_value.len() > MAX_REQUEST_SIZE {
+                return Err(NetError::RequestTooLarge);
+            }
+            let bytes = BytesMut::from(decoded_value.as_slice());
+            Ok(bytes)
+        }
+        Err(e) => Err(format!("Error decoding dns parameter: {}", e).into()),
+    }
 }
 
 /// Fetch the body of the request from the stream
