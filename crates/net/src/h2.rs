@@ -322,6 +322,7 @@ async fn send(
         let response_stream = response_future.await?;
         debug!("got response: {:#?}", response_stream);
         if response_stream.status() == StatusCode::URI_TOO_LONG && try_method == Method::GET {
+            warn!("URI_TOO_LONG, retrying with POST");
             try_method = Method::POST;
             h2 = h2.ready().await?;
         } else {

@@ -88,6 +88,7 @@ impl H3ClientStream {
             debug!("got response: {:#?}", response);
 
             if response.status() == StatusCode::URI_TOO_LONG && try_method == Method::GET {
+                warn!("URI_TOO_LONG, retrying with POST");
                 try_method = Method::POST;
             } else {
                 break (response, stream);
