@@ -19,8 +19,8 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 use futures_util::stream::Stream;
 use h2::client::SendRequest;
-use http::Method;
 use http::header::{self, CONTENT_LENGTH};
+use http::{Method, StatusCode};
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use tokio::time::timeout;
@@ -304,23 +304,30 @@ async fn send(
     method: Method,
 ) -> Result<DnsResponse, NetError> {
     let mut h2 = h2.ready().await?;
+    let mut try_method = method;
+    let mut response_stream = loop {
+        // build up the http request
+        let (request, body) = match try_method {
+            Method::GET => (cx.build_get(&message)?, None),
+            Method::POST => (cx.build_post(message.remaining())?, Some(message.clone())),
+            other => return Err(format!("unsupported method: {other}").into()),
+        };
+        debug!("request: {:#?}", request);
 
-    // build up the http request
-    let (request, body) = match method {
-        Method::GET => (cx.build_get(message)?, None),
-        Method::POST => (cx.build_post(message.remaining())?, Some(message)),
-        other => return Err(format!("unsupported method: {other}").into()),
+        // Send the request
+        let (response_future, mut send_stream) = h2.send_request(request, body.is_none())?;
+        if let Some(body) = body {
+            send_stream.send_data(body, true)?;
+        }
+        let response_stream = response_future.await?;
+        debug!("got response: {:#?}", response_stream);
+        if response_stream.status() == StatusCode::URI_TOO_LONG && try_method == Method::GET {
+            try_method = Method::POST;
+            h2 = h2.ready().await?;
+        } else {
+            break response_stream;
+        }
     };
-    debug!("request: {:#?}", request);
-
-    // Send the request
-    let (response_future, mut send_stream) = h2.send_request(request, body.is_none())?;
-    if let Some(body) = body {
-        send_stream.send_data(body, true)?;
-    }
-    let mut response_stream = response_future.await?;
-    debug!("got response: {:#?}", response_stream);
-
     // get the length of packet
     let content_length = response_stream
         .headers()

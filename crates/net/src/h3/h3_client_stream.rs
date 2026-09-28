@@ -18,8 +18,8 @@ use bytes::{Buf, Bytes};
 use futures_util::stream::Stream;
 use h3::client::SendRequest;
 use h3_quinn::OpenStreams;
-use http::Method;
 use http::header::{self, CONTENT_LENGTH};
+use http::{Method, StatusCode};
 use quinn::{Endpoint, EndpointConfig, TransportConfig};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -67,23 +67,32 @@ impl H3ClientStream {
         cx: Arc<RequestContext>,
         method: Method,
     ) -> Result<DnsResponse, NetError> {
-        // build up the http request
-        let (request, body) = match method {
-            Method::GET => (cx.build_get(message)?, None),
-            Method::POST => (cx.build_post(message.remaining())?, Some(message)),
-            other => return Err(format!("unsupported method: {other}").into()),
+        let mut try_method = method;
+        let (response, mut stream) = loop {
+            // build up the http request
+            let (request, body) = match try_method {
+                Method::GET => (cx.build_get(&message)?, None),
+                Method::POST => (cx.build_post(message.remaining())?, Some(message.clone())),
+                other => return Err(format!("unsupported method: {other}").into()),
+            };
+            debug!("request: {:#?}", request);
+
+            // Send the request
+            let mut stream = h3.send_request(request).await?;
+            if let Some(body) = body {
+                stream.send_data(body).await?;
+            }
+            stream.finish().await?;
+
+            let response = stream.recv_response().await?;
+            debug!("got response: {:#?}", response);
+
+            if response.status() == StatusCode::URI_TOO_LONG && try_method == Method::GET {
+                try_method = Method::POST;
+            } else {
+                break (response, stream);
+            }
         };
-        debug!("request: {:#?}", request);
-
-        // Send the request
-        let mut stream = h3.send_request(request).await?;
-        if let Some(body) = body {
-            stream.send_data(body).await?;
-        }
-        stream.finish().await?;
-
-        let response = stream.recv_response().await?;
-        debug!("got response: {:#?}", response);
 
         // get the length of packet
         let content_length = response

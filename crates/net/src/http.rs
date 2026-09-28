@@ -90,7 +90,7 @@ impl RequestContext {
             .map_err(|e| NetError::from(format!("http stream errored: {e}")))
     }
 
-    pub(crate) fn build_get(&self, message: Bytes) -> Result<Request<()>, NetError> {
+    pub(crate) fn build_get(&self, message: &Bytes) -> Result<Request<()>, NetError> {
         let uri_str = self.query_path.to_string()
             + "?dns="
             + data_encoding::BASE64URL_NOPAD.encode(&message).as_str();
